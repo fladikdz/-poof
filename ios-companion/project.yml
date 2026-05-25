@@ -10,6 +10,9 @@ options:
   deploymentTarget:
     iOS: "16.0"
   developmentLanguage: en
+  # Pin Xcode project file format to one Xcode 15.4+ can read, so newer
+  # xcodegen versions don't generate a format only Xcode 16 understands.
+  xcodeVersion: "15.0"
 
 settings:
   base:
@@ -30,43 +33,15 @@ targets:
     platform: iOS
     sources:
       - path: Sources/poof-ios
-    resources:
-      - path: Resources
-        excludes:
-          - "*.entitlements"
+    # NB: Info.plist and entitlements are referenced via build settings, NOT
+    # bundled as resources — otherwise xcodebuild gets two conflicting plists.
+    resources: []
     settings:
       base:
         INFOPLIST_FILE: Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Resources/poof-ios.entitlements
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
           - "@executable_path/Frameworks"
-    info:
-      path: Resources/Info.plist
-      properties:
-        CFBundleDisplayName: poof companion
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        UILaunchScreen: {}
-        UIRequiredDeviceCapabilities:
-          - bluetooth-le
-        UIBackgroundModes:
-          - bluetooth-peripheral
-          - bluetooth-central
-          - location
-        NSLocationAlwaysAndWhenInUseUsageDescription:
-          Used to display where iOS thinks the device is, so the desktop app can
-          show drift between the spoofed and real coordinates.
-        NSLocationWhenInUseUsageDescription:
-          Used to display the current iOS-reported location for drift monitoring.
-        NSBluetoothAlwaysUsageDescription:
-          Acts as a Bluetooth peripheral emulating a Pokemon Go Plus accessory,
-          and as a Bluetooth central to communicate with the desktop companion.
-        NSMotionUsageDescription:
-          Detects stationary vs moving state for accurate drift warnings.
-        UIRequiresFullScreen: false
-        UISupportedInterfaceOrientations:
-          - UIInterfaceOrientationPortrait
-        UIStatusBarStyle: UIStatusBarStyleDefault
-        UIRequiresPersistentWiFi: false
+        GENERATE_INFOPLIST_FILE: "NO"        # use our hand-written Info.plist
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: "YES"
