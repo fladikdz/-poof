@@ -1,0 +1,67 @@
+name: Build iOS Companion
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'ios-companion/**'
+      - '.github/workflows/build-ios.yml'
+  workflow_dispatch:  # manual trigger from the GitHub UI
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios-companion
+        run: xcodegen generate
+
+      - name: Build .app (unsigned)
+        working-directory: ios-companion
+        run: |
+          xcodebuild \
+            -project poof-ios.xcodeproj \
+            -scheme poof-ios \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package as .ipa
+        working-directory: ios-companion/build/Build/Products/Release-iphoneos
+        run: |
+          mkdir -p Payload
+          cp -R poof-ios.app Payload/
+          zip -qr poof-ios.ipa Payload
+          ls -lh poof-ios.ipa
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: poof-ios-unsigned-ipa
+          path: ios-companion/build/Build/Products/Release-iphoneos/poof-ios.ipa
+          if-no-files-found: error
+
+      - name: Attach to release (on release event)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ios-companion/build/Build/Products/Release-iphoneos/poof-ios.ipa

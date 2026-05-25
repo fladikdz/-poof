@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>poof map</title>
+  <link rel="stylesheet" href="leaflet/leaflet.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; background: #1e1e1e; }
+    .hud {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      background: rgba(20,20,20,0.85); color: #ddd; padding: 8px 12px;
+      border-radius: 6px; font: 12px/1.4 system-ui, sans-serif;
+      max-width: 280px;
+    }
+    .hud b { color: #4ec9b0; }
+    .hud .mode { color: #f0c674; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="hud" id="hud">
+    <b>poof</b> &mdash; mode: <span class="mode" id="mode-label">teleport</span><br />
+    <span id="instructions">click anywhere to teleport.</span><br />
+    <span id="status">No active spoof.</span>
+  </div>
+
+  <script src="leaflet/leaflet.js"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script>
+    L.Icon.Default.mergeOptions({
+      iconRetinaUrl: 'leaflet/marker-icon-2x.png',
+      iconUrl: 'leaflet/marker-icon.png',
+      shadowUrl: 'leaflet/marker-shadow.png',
+    });
+
+    const map = L.map('map').setView([52.2297, 21.0122], 12);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    // Mode state -----------------------------------------------------------
+    // 'teleport' — click sets/updates the single spoof point
+    // 'route'    — clicks accumulate as waypoints; OSRM is queried for the
+    //              actual road geometry; Start sends the dense road points
+    //              to Python for playback.
+    let mode = 'teleport';
+    let spoofMarker = null;          // current spoofed coord (teleport or route progress)
+    let routeWaypointMarkers = [];   // small markers for each waypoint pin
+    let routePolyline = null;        // line connecting waypoints (road-routed if OSRM succeeded)
+    let routeWaypoints = [];         // [[lat, lon], ...] — the user-clicked waypoints
+    let routeGeometry = [];          // road-following dense points, or fallback = waypoints
+    let osrmInflight = null;         // abort controller for the latest OSRM call
+
+    function setMode(newMode) {
+      mode = newMode;
+      const label = document.getElementById('mode-label');
+      const instr = document.getElementById('instructions');
+      label.textContent = newMode;
+      if (newMode === 'teleport') {
+        instr.textContent = 'click anywhere to teleport.';
+      } else if (newMode === 'route') {
+        instr.textContent = 'click to add waypoints, then press Start.';
+      }
+    }
+    window.setMode = setMode;
+
+    function setStatus(text) {
+      document.getElementById('status').textContent = text;
+    }
+
+    function showSpoof(lat, lon) {
+      if (spoofMarker) spoofMarker.setLatLng([lat, lon]);
+      else spoofMarker = L.marker([lat, lon]).addTo(map);
+      document.getElementById('status').innerHTML =
+        'Spoofing: <b>' + lat.toFixed(6) + ', ' + lon.toFixed(6) + '</b>';
+    }
+    window.showSpoof = showSpoof;
+
+    function clearSpoof() {
+      if (spoofMarker) { spoofMarker.remove(); spoofMarker = null; }
+      setStatus('No active spoof.');
+    }
+    window.clearSpoof = clearSpoof;
+
+    function clearRouteWaypoints() {
+      routeWaypointMarkers.forEach(m => m.remove());
+      routeWaypointMarkers = [];
+      if (routePolyline) { routePolyline.remove(); routePolyline = null; }
+      routeWaypoints = [];
+      routeGeometry = [];
+      if (osrmInflight) { try { osrmInflight.abort(); } catch (e) {} osrmInflight = null; }
+      if (bridge && bridge.set_waypoints) bridge.set_waypoints([]);
+      if (bridge && bridge.set_route_geometry) bridge.set_route_geometry([]);
+    }
+    window.clearRouteWaypoints = clearRouteWaypoints;
+
+    // Query OSRM public demo server for a driving route between waypoints.
+    // Returns dense [[lat, lon], ...] following actual roads, or null on failure.
+    async function queryOsrm(waypoints) {
+      if (waypoints.length < 2) return null;
+      const coords = waypoints
+        .map(p => p[1].toFixed(6) + ',' + p[0].toFixed(6))  // OSRM expects lon,lat
+        .join(';');
+      const url = 'https://router.project-osrm.org/route/v1/driving/' + coords
+                + '?overview=full&geometries=geojson';
+      if (osrmInflight) { try { osrmInflight.abort(); } catch (e) {} }
+      osrmInflight = new AbortController();
+      try {
+        const r = await fetch(url, { signal: osrmInflight.signal });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        if (data.code !== 'Ok' || !data.routes || !data.routes.length) {
+          throw new Error(data.message || data.code || 'no route');
+        }
+        // OSRM returns [lon, lat]; convert to [lat, lon] for Leaflet/Python.
+        return data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          console.log('poof: OSRM failed, falling back to straight line. ' + e.message);
+        }
+        return null;
+      } finally {
+        osrmInflight = null;
+      }
+    }
+
+    // Distinct search-result marker (different colour from waypoints).
+    let searchMarker = null;
+    function showSearchResult(lat, lon, name) {
+      if (searchMarker) searchMarker.remove();
+      searchMarker = L.circleMarker([lat, lon], {
+        radius: 8, fillOpacity: 0.9, fillColor: '#4ec9b0',
+        color: '#1e1e1e', weight: 2,
+      }).bindTooltip(name || 'result', { direction: 'top', offset: [0, -8] })
+        .addTo(map);
+      searchMarker.openTooltip();
+      map.flyTo([lat, lon], Math.max(map.getZoom(), 14), { duration: 0.6 });
+    }
+    window.showSearchResult = showSearchResult;
+    window.addWaypoint = addWaypoint;  // expose for Python "Route from here"
+
+    function addWaypoint(lat, lon) {
+      const idx = routeWaypoints.length;
+      routeWaypoints.push([lat, lon]);
+
+      const m = L.circleMarker([lat, lon], {
+        radius: 6, fillOpacity: 1, fillColor: '#f0c674',
+        color: '#1e1e1e', weight: 2,
+      }).bindTooltip(String(idx + 1), { permanent: true, direction: 'top', offset: [0, -6] })
+        .addTo(map);
+      routeWaypointMarkers.push(m);
+
+      // Send the user-clicked points to Python so the side list updates.
+      if (bridge && bridge.set_waypoints) bridge.set_waypoints(routeWaypoints);
+
+      if (routeWaypoints.length < 2) {
+        setStatus('Waypoints: 1');
+        return;
+      }
+
+      // Draw straight-line polyline immediately as a placeholder while we wait
+      // for the OSRM-routed geometry; replace it once OSRM returns.
+      if (routePolyline) routePolyline.remove();
+      routePolyline = L.polyline(routeWaypoints, {
+        color: '#888', weight: 2, opacity: 0.6, dashArray: '4 6'
+      }).addTo(map);
+      setStatus('Routing via roads…');
+
+      queryOsrm(routeWaypoints).then(routed => {
+        // Make sure the user didn't clear/replace while we were waiting.
+        if (routePolyline) routePolyline.remove();
+        const geom = routed && routed.length > 1 ? routed : routeWaypoints;
+        routePolyline = L.polyline(geom, {
+          color: '#f0c674', weight: 4, opacity: 0.85,
+        }).addTo(map);
+        routeGeometry = geom;
+        setStatus('Waypoints: ' + routeWaypoints.length
+                  + (routed ? ' (road route ready)' : ' (straight line — OSRM unavailable)'));
+        if (bridge && bridge.set_route_geometry) bridge.set_route_geometry(geom);
+      });
+    }
+
+    // Bridge -----------------------------------------------------------
+    let bridge = null;
+    if (typeof QWebChannel !== 'undefined') {
+      new QWebChannel(qt.webChannelTransport, function (channel) {
+        bridge = channel.objects.bridge;
+        console.log('poof: QWebChannel ready');
+      });
+    }
+
+    map.on('click', function (e) {
+      if (!bridge) return;
+      if (mode === 'teleport' && bridge.teleport_to) {
+        bridge.teleport_to(e.latlng.lat, e.latlng.lng);
+      } else if (mode === 'route') {
+        addWaypoint(e.latlng.lat, e.latlng.lng);
+      }
+    });
+  </script>
+</body>
+</html>
